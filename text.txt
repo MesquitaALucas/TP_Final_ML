@@ -1,0 +1,153 @@
+import pandas as pd
+import numpy as np
+import ast
+from sklearn.model_selection import train_test_split
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import BertTokenizer, BertForSequenceClassification, AdamW, get_linear_schedule_with_warmup
+from tqdm import tqdm
+
+df = pd.read_csv('livros.csv')
+df = df.dropna(subset=['category', 'description'])
+df = df.drop(["url", "publisher", "cover type/page num.", "ISBN-10", "ISBN-13", "best bellers rank", "review score", "num. of reviews", "frequently bought togheter"], axis=1)
+df['category'] = df['category'].replace(np.nan, '[]')
+
+# Use ast.literal_eval para converter strings em listas
+df['category'] = df['category'].apply(ast.literal_eval)
+
+# Determine o comprimento máximo da lista
+max_list_length = df['category'].apply(len).max()
+
+# Crie os nomes das novas colunas
+column_names = [f'Categoria{i+1}' for i in range(max_list_length)]
+
+# Crie colunas separadas a partir das listas
+df[column_names] = pd.DataFrame(df['category'].tolist(), index=df.index)
+
+df = df.drop(["category", "Categoria1"], axis=1)
+
+# Filtrar e preparar DataFrames
+df_categ1 = df.drop(["Categoria3"], axis=1).dropna(subset=['Categoria2'])
+
+# Converta a coluna 'Categoria2' para inteiros (ou mapeie strings para inteiros)
+df_categ1['Categoria2'] = df_categ1['Categoria2'].astype('category').cat.codes
+
+# Dividir o DataFrame em treino, validação e teste
+train_df_categ1, temp_df_categ1 = train_test_split(df_categ1, test_size=0.2, random_state=42)
+val_df_categ1, test_df_categ1 = train_test_split(temp_df_categ1, test_size=0.5, random_state=42)
+
+# Definir a classe do Dataset
+class BookDataset(Dataset):
+    def __init__(self, df, tokenizer, max_length):
+        self.descriptions = df['description'].values
+        self.labels = df['Categoria2'].values
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.descriptions)
+
+    def __getitem__(self, idx):
+        description = self.descriptions[idx]
+        label = self.labels[idx]
+
+        encoding = self.tokenizer.encode_plus(
+            description,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            return_token_type_ids=False,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'description_text': description,
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+# Inicializar tokenizer e parâmetros
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+max_length = 128
+batch_size = 16
+
+# Preparar DataLoader
+train_dataset = BookDataset(train_df_categ1, tokenizer, max_length)
+val_dataset = BookDataset(val_df_categ1, tokenizer, max_length)
+
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# Treinamento
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=len(df_categ1['Categoria2'].unique()))
+optimizer = AdamW(model.parameters(), lr=2e-5)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=len(train_loader) * epochs)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+# Função de acurácia
+def accuracy(preds, labels):
+    pred_flat = np.argmax(preds, axis=1).flatten()
+    labels_flat = labels.flatten()
+    return np.sum(pred_flat == labels_flat) / len(labels_flat)
+
+# Loop de treinamento
+epochs = 5
+
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0
+    train_acc = 0
+
+    loop = tqdm(train_loader, leave=True)
+    for batch in loop:
+        optimizer.zero_grad()
+        
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        logits = outputs.logits
+        
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        
+        train_loss += loss.item()
+        train_acc += accuracy(logits.detach().cpu().numpy(), labels.cpu().numpy())
+        
+        loop.set_description(f'Epoch {epoch + 1}')
+        loop.set_postfix(loss=loss.item(), acc=train_acc / len(train_loader))
+
+    avg_train_loss = train_loss / len(train_loader)
+    avg_train_acc = train_acc / len(train_loader)
+    
+    model.eval()
+    val_loss = 0
+    val_acc = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
+            
+            val_loss += loss.item()
+            val_acc += accuracy(logits.detach().cpu().numpy(), labels.cpu().numpy())
+
+    avg_val_loss = val_loss / len(val_loader)
+    avg_val_acc = val_acc / len(val_loader)
+    
+    print(f'Epoch {epoch + 1}')
+    print(f'Training loss: {avg_train_loss}, Training accuracy: {avg_train_acc}')
+    print(f'Validation loss: {avg_val_loss}, Validation accuracy: {avg_val_acc}')
